@@ -4,18 +4,59 @@ import json
 import os
 import re
 import subprocess
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, TypedDict, cast, TypeVar
 
 import models
-from python.helpers import runtime, whisper, defer
+from python.helpers import runtime, whisper, defer, git
 from . import files, dotenv
 from python.helpers.print_style import PrintStyle
+from python.helpers.providers import get_providers, FieldOption as ProvidersFO
+from python.helpers.secrets import get_default_secrets_manager
+from python.helpers import dirty_json
+from python.helpers.notification import NotificationManager, NotificationType, NotificationPriority
 
+
+T = TypeVar('T')
+
+def get_default_value(name: str, value: T) -> T:
+    """
+    Load setting value from .env with A0_SET_ prefix, falling back to default.
+
+    Args:
+        name: Setting name (will be prefixed with A0_SET_)
+        value: Default value to use if env var not set
+
+    Returns:
+        Environment variable value (type-normalized) or default value
+    """
+    env_value = dotenv.get_dotenv_value(f"A0_SET_{name}", dotenv.get_dotenv_value(f"A0_SET_{name.upper()}", None))
+
+    if env_value is None:
+        return value
+
+    # Normalize type to match value param type
+    try:
+        if isinstance(value, bool):
+            return env_value.strip().lower() in ('true', '1', 'yes', 'on')  # type: ignore
+        elif isinstance(value, dict):
+            return json.loads(env_value.strip())  # type: ignore
+        elif isinstance(value, str):
+            return str(env_value).strip()  # type: ignore
+        else:
+            return type(value)(env_value.strip())  # type: ignore
+    except (ValueError, TypeError, json.JSONDecodeError) as e:
+        PrintStyle(background_color="yellow", font_color="black").print(
+            f"Warning: Invalid value for A0_SET_{name}='{env_value}': {e}. Using default: {value}"
+        )
+        return value
 
 class Settings(TypedDict):
+    version: str
+
     chat_model_provider: str
     chat_model_name: str
-    chat_model_kwargs: dict[str, str]
+    chat_model_api_base: str
+    chat_model_kwargs: dict[str, Any]
     chat_model_ctx_length: int
     chat_model_ctx_history: float
     chat_model_vision: bool
@@ -25,7 +66,8 @@ class Settings(TypedDict):
 
     util_model_provider: str
     util_model_name: str
-    util_model_kwargs: dict[str, str]
+    util_model_api_base: str
+    util_model_kwargs: dict[str, Any]
     util_model_ctx_length: int
     util_model_ctx_input: float
     util_model_rl_requests: int
@@ -34,18 +76,47 @@ class Settings(TypedDict):
 
     embed_model_provider: str
     embed_model_name: str
-    embed_model_kwargs: dict[str, str]
+    embed_model_api_base: str
+    embed_model_kwargs: dict[str, Any]
     embed_model_rl_requests: int
     embed_model_rl_input: int
 
     browser_model_provider: str
     browser_model_name: str
+    browser_model_api_base: str
     browser_model_vision: bool
-    browser_model_kwargs: dict[str, str]
+    browser_model_rl_requests: int
+    browser_model_rl_input: int
+    browser_model_rl_output: int
+    browser_model_kwargs: dict[str, Any]
+    browser_http_headers: dict[str, Any]
 
-    agent_prompts_subdir: str
+    agent_profile: str
     agent_memory_subdir: str
     agent_knowledge_subdir: str
+
+    workdir_path: str
+    workdir_show: bool
+    workdir_max_depth: int
+    workdir_max_files: int
+    workdir_max_folders: int
+    workdir_max_lines: int
+    workdir_gitignore: str
+
+    memory_recall_enabled: bool
+    memory_recall_delayed: bool
+    memory_recall_interval: int
+    memory_recall_history_len: int
+    memory_recall_memories_max_search: int
+    memory_recall_solutions_max_search: int
+    memory_recall_memories_max_result: int
+    memory_recall_solutions_max_result: int
+    memory_recall_similarity_threshold: float
+    memory_recall_query_prep: bool
+    memory_recall_post_filter: bool
+    memory_memorize_enabled: bool
+    memory_memorize_consolidation: bool
+    memory_memorize_replace_threshold: float
 
     api_keys: dict[str, str]
 
@@ -59,17 +130,33 @@ class Settings(TypedDict):
     rfc_port_http: int
     rfc_port_ssh: int
 
+    shell_interface: Literal['local','ssh']
+    websocket_server_restart_enabled: bool
+    uvicorn_access_logs_enabled: bool
+
     stt_model_size: str
     stt_language: str
     stt_silence_threshold: float
     stt_silence_duration: int
     stt_waiting_timeout: int
 
+    tts_kokoro: bool
+
     mcp_servers: str
     mcp_client_init_timeout: int
     mcp_client_tool_timeout: int
     mcp_server_enabled: bool
     mcp_server_token: str
+
+    a2a_server_enabled: bool
+
+    variables: str
+    secrets: str
+
+    # LiteLLM global kwargs applied to all model calls
+    litellm_global_kwargs: dict[str, Any]
+
+    update_check_enabled: bool
 
 
 class PartialSettings(Settings, total=False):
@@ -80,13 +167,20 @@ class FieldOption(TypedDict):
     value: str
     label: str
 
-
 class SettingsField(TypedDict, total=False):
     id: str
     title: str
     description: str
     type: Literal[
-        "text", "number", "select", "range", "textarea", "password", "switch", "button"
+        "text",
+        "number",
+        "select",
+        "range",
+        "textarea",
+        "password",
+        "switch",
+        "button",
+        "html",
     ]
     value: Any
     min: float
@@ -94,6 +188,7 @@ class SettingsField(TypedDict, total=False):
     step: float
     hidden: bool
     options: list[FieldOption]
+    style: str
 
 
 class SettingsSection(TypedDict, total=False):
@@ -103,529 +198,62 @@ class SettingsSection(TypedDict, total=False):
     fields: list[SettingsField]
     tab: str  # Indicates which tab this section belongs to
 
+class ModelProvider(ProvidersFO):
+    pass
+
+class SettingsOutputAdditional(TypedDict):
+    chat_providers: list[ModelProvider]
+    embedding_providers: list[ModelProvider]
+    shell_interfaces: list[FieldOption]
+    agent_subdirs: list[FieldOption]
+    knowledge_subdirs: list[FieldOption]
+    stt_models: list[FieldOption]
+    is_dockerized: bool
+    runtime_settings: dict[str, Any]
+
 
 class SettingsOutput(TypedDict):
-    sections: list[SettingsSection]
+    settings: Settings
+    additional: SettingsOutputAdditional
 
 
 PASSWORD_PLACEHOLDER = "****PSWD****"
+API_KEY_PLACEHOLDER = "************"
 
-SETTINGS_FILE = files.get_abs_path("tmp/settings.json")
+SETTINGS_FILE = files.get_abs_path("usr/settings.json")
 _settings: Settings | None = None
+_runtime_settings_snapshot: Settings | None = None
 
+OptionT = TypeVar("OptionT", bound=FieldOption)
+
+def _ensure_option_present(options: list[OptionT] | None, current_value: str | None) -> list[OptionT]:
+    """
+    Ensure the currently selected value exists in a dropdown options list.
+    If missing, inserts it at the front as {value: current_value, label: current_value}.
+    """
+    opts = list(options or [])
+    if not current_value:
+        return opts
+    for o in opts:
+        if o.get("value") == current_value:
+            return opts
+    opts.insert(0, cast(OptionT, {"value": current_value, "label": current_value}))
+    return opts
 
 def convert_out(settings: Settings) -> SettingsOutput:
-    from models import ModelProvider
-
-    # main model section
-    chat_model_fields: list[SettingsField] = []
-    chat_model_fields.append(
-        {
-            "id": "chat_model_provider",
-            "title": "Chat model provider",
-            "description": "Select provider for main chat model used by Agent Zero",
-            "type": "select",
-            "value": settings["chat_model_provider"],
-            "options": [{"value": p.name, "label": p.value} for p in ModelProvider],
-        }
-    )
-    chat_model_fields.append(
-        {
-            "id": "chat_model_name",
-            "title": "Chat model name",
-            "description": "Exact name of model from selected provider",
-            "type": "text",
-            "value": settings["chat_model_name"],
-        }
-    )
-
-    chat_model_fields.append(
-        {
-            "id": "chat_model_ctx_length",
-            "title": "Chat model context length",
-            "description": "Maximum number of tokens in the context window for LLM. System prompt, chat history, RAG and response all count towards this limit.",
-            "type": "number",
-            "value": settings["chat_model_ctx_length"],
-        }
-    )
-
-    chat_model_fields.append(
-        {
-            "id": "chat_model_ctx_history",
-            "title": "Context window space for chat history",
-            "description": "Portion of context window dedicated to chat history visible to the agent. Chat history will automatically be optimized to fit. Smaller size will result in shorter and more summarized history. The remaining space will be used for system prompt, RAG and response.",
-            "type": "range",
-            "min": 0.01,
-            "max": 1,
-            "step": 0.01,
-            "value": settings["chat_model_ctx_history"],
-        }
-    )
-
-    chat_model_fields.append(
-        {
-            "id": "chat_model_vision",
-            "title": "Supports Vision",
-            "description": "Models capable of Vision can for example natively see the content of image attachments.",
-            "type": "switch",
-            "value": settings["chat_model_vision"],
-        }
-    )
-
-    chat_model_fields.append(
-        {
-            "id": "chat_model_rl_requests",
-            "title": "Requests per minute limit",
-            "description": "Limits the number of requests per minute to the chat model. Waits if the limit is exceeded. Set to 0 to disable rate limiting.",
-            "type": "number",
-            "value": settings["chat_model_rl_requests"],
-        }
-    )
-
-    chat_model_fields.append(
-        {
-            "id": "chat_model_rl_input",
-            "title": "Input tokens per minute limit",
-            "description": "Limits the number of input tokens per minute to the chat model. Waits if the limit is exceeded. Set to 0 to disable rate limiting.",
-            "type": "number",
-            "value": settings["chat_model_rl_input"],
-        }
-    )
-
-    chat_model_fields.append(
-        {
-            "id": "chat_model_rl_output",
-            "title": "Output tokens per minute limit",
-            "description": "Limits the number of output tokens per minute to the chat model. Waits if the limit is exceeded. Set to 0 to disable rate limiting.",
-            "type": "number",
-            "value": settings["chat_model_rl_output"],
-        }
-    )
-
-    chat_model_fields.append(
-        {
-            "id": "chat_model_kwargs",
-            "title": "Chat model additional parameters",
-            "description": "Any other parameters supported by the model. Format is KEY=VALUE on individual lines, just like .env file.",
-            "type": "textarea",
-            "value": _dict_to_env(settings["chat_model_kwargs"]),
-        }
-    )
-
-    chat_model_section: SettingsSection = {
-        "id": "chat_model",
-        "title": "Chat Model",
-        "description": "Selection and settings for main chat model used by Agent Zero",
-        "fields": chat_model_fields,
-        "tab": "agent",
-    }
-
-    # main model section
-    util_model_fields: list[SettingsField] = []
-    util_model_fields.append(
-        {
-            "id": "util_model_provider",
-            "title": "Utility model provider",
-            "description": "Select provider for utility model used by the framework",
-            "type": "select",
-            "value": settings["util_model_provider"],
-            "options": [{"value": p.name, "label": p.value} for p in ModelProvider],
-        }
-    )
-    util_model_fields.append(
-        {
-            "id": "util_model_name",
-            "title": "Utility model name",
-            "description": "Exact name of model from selected provider",
-            "type": "text",
-            "value": settings["util_model_name"],
-        }
-    )
-
-    util_model_fields.append(
-        {
-            "id": "util_model_rl_requests",
-            "title": "Requests per minute limit",
-            "description": "Limits the number of requests per minute to the utility model. Waits if the limit is exceeded. Set to 0 to disable rate limiting.",
-            "type": "number",
-            "value": settings["util_model_rl_requests"],
-        }
-    )
-
-    util_model_fields.append(
-        {
-            "id": "util_model_rl_input",
-            "title": "Input tokens per minute limit",
-            "description": "Limits the number of input tokens per minute to the utility model. Waits if the limit is exceeded. Set to 0 to disable rate limiting.",
-            "type": "number",
-            "value": settings["util_model_rl_input"],
-        }
-    )
-
-    util_model_fields.append(
-        {
-            "id": "util_model_rl_output",
-            "title": "Output tokens per minute limit",
-            "description": "Limits the number of output tokens per minute to the utility model. Waits if the limit is exceeded. Set to 0 to disable rate limiting.",
-            "type": "number",
-            "value": settings["util_model_rl_output"],
-        }
-    )
-
-    util_model_fields.append(
-        {
-            "id": "util_model_kwargs",
-            "title": "Utility model additional parameters",
-            "description": "Any other parameters supported by the model. Format is KEY=VALUE on individual lines, just like .env file.",
-            "type": "textarea",
-            "value": _dict_to_env(settings["util_model_kwargs"]),
-        }
-    )
-
-    util_model_section: SettingsSection = {
-        "id": "util_model",
-        "title": "Utility model",
-        "description": "Smaller, cheaper, faster model for handling utility tasks like organizing memory, preparing prompts, summarizing.",
-        "fields": util_model_fields,
-        "tab": "agent",
-    }
-
-    # embedding model section
-    embed_model_fields: list[SettingsField] = []
-    embed_model_fields.append(
-        {
-            "id": "embed_model_provider",
-            "title": "Embedding model provider",
-            "description": "Select provider for embedding model used by the framework",
-            "type": "select",
-            "value": settings["embed_model_provider"],
-            "options": [{"value": p.name, "label": p.value} for p in ModelProvider],
-        }
-    )
-    embed_model_fields.append(
-        {
-            "id": "embed_model_name",
-            "title": "Embedding model name",
-            "description": "Exact name of model from selected provider",
-            "type": "text",
-            "value": settings["embed_model_name"],
-        }
-    )
-
-    embed_model_fields.append(
-        {
-            "id": "embed_model_rl_requests",
-            "title": "Requests per minute limit",
-            "description": "Limits the number of requests per minute to the embedding model. Waits if the limit is exceeded. Set to 0 to disable rate limiting.",
-            "type": "number",
-            "value": settings["embed_model_rl_requests"],
-        }
-    )
-
-    embed_model_fields.append(
-        {
-            "id": "embed_model_rl_input",
-            "title": "Input tokens per minute limit",
-            "description": "Limits the number of input tokens per minute to the embedding model. Waits if the limit is exceeded. Set to 0 to disable rate limiting.",
-            "type": "number",
-            "value": settings["embed_model_rl_input"],
-        }
-    )
-
-    embed_model_fields.append(
-        {
-            "id": "embed_model_kwargs",
-            "title": "Embedding model additional parameters",
-            "description": "Any other parameters supported by the model. Format is KEY=VALUE on individual lines, just like .env file.",
-            "type": "textarea",
-            "value": _dict_to_env(settings["embed_model_kwargs"]),
-        }
-    )
-
-    embed_model_section: SettingsSection = {
-        "id": "embed_model",
-        "title": "Embedding Model",
-        "description": "Settings for the embedding model used by Agent Zero.",
-        "fields": embed_model_fields,
-        "tab": "agent",
-    }
-
-    # embedding model section
-    browser_model_fields: list[SettingsField] = []
-    browser_model_fields.append(
-        {
-            "id": "browser_model_provider",
-            "title": "Web Browser model provider",
-            "description": "Select provider for web browser model used by <a href='https://github.com/browser-use/browser-use' target='_blank'>browser-use</a> framework",
-            "type": "select",
-            "value": settings["browser_model_provider"],
-            "options": [{"value": p.name, "label": p.value} for p in ModelProvider],
-        }
-    )
-    browser_model_fields.append(
-        {
-            "id": "browser_model_name",
-            "title": "Web Browser model name",
-            "description": "Exact name of model from selected provider",
-            "type": "text",
-            "value": settings["browser_model_name"],
-        }
-    )
-
-    browser_model_fields.append(
-        {
-            "id": "browser_model_vision",
-            "title": "Use Vision",
-            "description": "Models capable of Vision can use it to analyze web pages from screenshots. Increases quality but also token usage.",
-            "type": "switch",
-            "value": settings["browser_model_vision"],
-        }
-    )
-
-    browser_model_fields.append(
-        {
-            "id": "browser_model_kwargs",
-            "title": "Web Browser model additional parameters",
-            "description": "Any other parameters supported by the model. Format is KEY=VALUE on individual lines, just like .env file.",
-            "type": "textarea",
-            "value": _dict_to_env(settings["browser_model_kwargs"]),
-        }
-    )
-
-    browser_model_section: SettingsSection = {
-        "id": "browser_model",
-        "title": "Web Browser Model",
-        "description": "Settings for the web browser model. Agent Zero uses <a href='https://github.com/browser-use/browser-use' target='_blank'>browser-use</a> agentic framework to handle web interactions.",
-        "fields": browser_model_fields,
-        "tab": "agent",
-    }
-
-    # # Memory settings section
-    # memory_fields: list[SettingsField] = []
-    # memory_fields.append(
-    #     {
-    #         "id": "memory_settings",
-    #         "title": "Memory Settings",
-    #         "description": "<settings for memory>",
-    #         "type": "text",
-    #         "value": "",
-    #     }
-    # )
-
-    # memory_section: SettingsSection = {
-    #     "id": "memory",
-    #     "title": "Memory Settings",
-    #     "description": "<settings for memory management here>",
-    #     "fields": memory_fields,
-    # }
-
-    # basic auth section
-    auth_fields: list[SettingsField] = []
-
-    auth_fields.append(
-        {
-            "id": "auth_login",
-            "title": "UI Login",
-            "description": "Set user name for web UI",
-            "type": "text",
-            "value": dotenv.get_dotenv_value(dotenv.KEY_AUTH_LOGIN) or "",
-        }
-    )
-
-    auth_fields.append(
-        {
-            "id": "auth_password",
-            "title": "UI Password",
-            "description": "Set user password for web UI",
-            "type": "password",
-            "value": (
-                PASSWORD_PLACEHOLDER
-                if dotenv.get_dotenv_value(dotenv.KEY_AUTH_PASSWORD)
-                else ""
-            ),
-        }
-    )
-
-    if runtime.is_dockerized():
-        auth_fields.append(
-            {
-                "id": "root_password",
-                "title": "root Password",
-                "description": "Change linux root password in docker container. This password can be used for SSH access. Original password was randomly generated during setup.",
-                "type": "password",
-                "value": "",
-            }
-        )
-
-    auth_section: SettingsSection = {
-        "id": "auth",
-        "title": "Authentication",
-        "description": "Settings for authentication to use Agent Zero Web UI.",
-        "fields": auth_fields,
-        "tab": "external",
-    }
-
-    # api keys model section
-    api_keys_fields: list[SettingsField] = []
-    api_keys_fields.append(_get_api_key_field(settings, "openai", "OpenAI API Key"))
-    api_keys_fields.append(
-        _get_api_key_field(settings, "anthropic", "Anthropic API Key")
-    )
-    api_keys_fields.append(_get_api_key_field(settings, "chutes", "Chutes API Key"))
-    api_keys_fields.append(_get_api_key_field(settings, "deepseek", "DeepSeek API Key"))
-    api_keys_fields.append(_get_api_key_field(settings, "google", "Google API Key"))
-    api_keys_fields.append(_get_api_key_field(settings, "groq", "Groq API Key"))
-    api_keys_fields.append(
-        _get_api_key_field(settings, "huggingface", "HuggingFace API Key")
-    )
-    api_keys_fields.append(
-        _get_api_key_field(settings, "mistralai", "MistralAI API Key")
-    )
-    api_keys_fields.append(
-        _get_api_key_field(settings, "openrouter", "OpenRouter API Key")
-    )
-    api_keys_fields.append(
-        _get_api_key_field(settings, "sambanova", "Sambanova API Key")
-    )
-
-    api_keys_section: SettingsSection = {
-        "id": "api_keys",
-        "title": "API Keys",
-        "description": "API keys for model providers and services used by Agent Zero.",
-        "fields": api_keys_fields,
-        "tab": "external",
-    }
-
-    # Agent config section
-    agent_fields: list[SettingsField] = []
-
-    agent_fields.append(
-        {
-            "id": "agent_prompts_subdir",
-            "title": "Prompts Subdirectory",
-            "description": "Subdirectory of /prompts folder to use for agent prompts. Used to adjust agent behaviour.",
-            "type": "select",
-            "value": settings["agent_prompts_subdir"],
-            "options": [
-                {"value": subdir, "label": subdir}
-                for subdir in files.get_subdirectories("prompts")
-            ],
-        }
-    )
-
-    agent_fields.append(
-        {
-            "id": "agent_memory_subdir",
-            "title": "Memory Subdirectory",
-            "description": "Subdirectory of /memory folder to use for agent memory storage. Used to separate memory storage between different instances.",
-            "type": "text",
-            "value": settings["agent_memory_subdir"],
-            # "options": [
-            #     {"value": subdir, "label": subdir}
-            #     for subdir in files.get_subdirectories("memory", exclude="embeddings")
-            # ],
-        }
-    )
-
-    agent_fields.append(
-        {
-            "id": "agent_knowledge_subdir",
-            "title": "Knowledge subdirectory",
-            "description": "Subdirectory of /knowledge folder to use for agent knowledge import. 'default' subfolder is always imported and contains framework knowledge.",
-            "type": "select",
-            "value": settings["agent_knowledge_subdir"],
-            "options": [
-                {"value": subdir, "label": subdir}
-                for subdir in files.get_subdirectories("knowledge", exclude="default")
-            ],
-        }
-    )
-
-    agent_section: SettingsSection = {
-        "id": "agent",
-        "title": "Agent Config",
-        "description": "Agent parameters.",
-        "fields": agent_fields,
-        "tab": "agent",
-    }
-
-    dev_fields: list[SettingsField] = []
-
-    if runtime.is_development():
-        # dev_fields.append(
-        #     {
-        #         "id": "rfc_auto_docker",
-        #         "title": "RFC Auto Docker Management",
-        #         "description": "Automatically create dockerized instance of A0 for RFCs using this instance's code base and, settings and .env.",
-        #         "type": "text",
-        #         "value": settings["rfc_auto_docker"],
-        #     }
-        # )
-
-        dev_fields.append(
-            {
-                "id": "rfc_url",
-                "title": "RFC Destination URL",
-                "description": "URL of dockerized A0 instance for remote function calls. Do not specify port here.",
-                "type": "text",
-                "value": settings["rfc_url"],
-            }
-        )
-
-    dev_fields.append(
-        {
-            "id": "rfc_password",
-            "title": "RFC Password",
-            "description": "Password for remote function calls. Passwords must match on both instances. RFCs can not be used with empty password.",
-            "type": "password",
-            "value": (
-                PASSWORD_PLACEHOLDER
-                if dotenv.get_dotenv_value(dotenv.KEY_RFC_PASSWORD)
-                else ""
-            ),
-        }
-    )
-
-    if runtime.is_development():
-        dev_fields.append(
-            {
-                "id": "rfc_port_http",
-                "title": "RFC HTTP port",
-                "description": "HTTP port for dockerized instance of A0.",
-                "type": "text",
-                "value": settings["rfc_port_http"],
-            }
-        )
-
-        dev_fields.append(
-            {
-                "id": "rfc_port_ssh",
-                "title": "RFC SSH port",
-                "description": "SSH port for dockerized instance of A0.",
-                "type": "text",
-                "value": settings["rfc_port_ssh"],
-            }
-        )
-
-    dev_section: SettingsSection = {
-        "id": "dev",
-        "title": "Development",
-        "description": "Parameters for A0 framework development. RFCs (remote function calls) are used to call functions on another A0 instance. You can develop and debug A0 natively on your local system while redirecting some functions to A0 instance in docker. This is crucial for development as A0 needs to run in standardized environment to support all features.",
-        "fields": dev_fields,
-        "tab": "developer",
-    }
-
-    # Speech to text section
-    stt_fields: list[SettingsField] = []
-
-    stt_fields.append(
-        {
-            "id": "stt_model_size",
-            "title": "Model Size",
-            "description": "Select the speech recognition model size",
-            "type": "select",
-            "value": settings["stt_model_size"],
-            "options": [
+    out = SettingsOutput(
+        settings = settings.copy(),
+        additional = SettingsOutputAdditional(
+            chat_providers=get_providers("chat"),
+            embedding_providers=get_providers("embedding"),
+            shell_interfaces=[{"value": "local", "label": "Local Python TTY"}, {"value": "ssh", "label": "SSH"}],
+            is_dockerized=runtime.is_dockerized(),
+            agent_subdirs=[{"value": subdir, "label": subdir}
+                for subdir in files.get_subdirectories("agents")
+                if subdir != "_example"],
+            knowledge_subdirs=[{"value": subdir, "label": subdir}
+                for subdir in files.get_subdirectories("knowledge", exclude="default")],
+            stt_models=[
                 {"value": "tiny", "label": "Tiny (39M, English)"},
                 {"value": "base", "label": "Base (74M, English)"},
                 {"value": "small", "label": "Small (244M, English)"},
@@ -633,185 +261,94 @@ def convert_out(settings: Settings) -> SettingsOutput:
                 {"value": "large", "label": "Large (1.5B, Multilingual)"},
                 {"value": "turbo", "label": "Turbo (Multilingual)"},
             ],
-        }
+            runtime_settings={},
+        ),
     )
 
-    stt_fields.append(
-        {
-            "id": "stt_language",
-            "title": "Language Code",
-            "description": "Language code (e.g. en, fr, it)",
-            "type": "text",
-            "value": settings["stt_language"],
-        }
-    )
+    # ensure dropdown options include currently selected values
+    additional = out["additional"]
+    current = out["settings"]
 
-    stt_fields.append(
-        {
-            "id": "stt_silence_threshold",
-            "title": "Silence threshold",
-            "description": "Silence detection threshold. Lower values are more sensitive.",
-            "type": "range",
-            "min": 0,
-            "max": 1,
-            "step": 0.01,
-            "value": settings["stt_silence_threshold"],
-        }
-    )
-
-    stt_fields.append(
-        {
-            "id": "stt_silence_duration",
-            "title": "Silence duration (ms)",
-            "description": "Duration of silence before the server considers speaking to have ended.",
-            "type": "text",
-            "value": settings["stt_silence_duration"],
-        }
-    )
-
-    stt_fields.append(
-        {
-            "id": "stt_waiting_timeout",
-            "title": "Waiting timeout (ms)",
-            "description": "Duration before the server closes the microphone.",
-            "type": "text",
-            "value": settings["stt_waiting_timeout"],
-        }
-    )
-
-    stt_section: SettingsSection = {
-        "id": "stt",
-        "title": "Speech to Text",
-        "description": "Voice transcription preferences and server turn detection settings.",
-        "fields": stt_fields,
-        "tab": "agent",
+    default_settings = get_default_settings()
+    runtime_settings = _runtime_settings_snapshot or settings
+    additional["runtime_settings"] = {
+        "uvicorn_access_logs_enabled": bool(
+            runtime_settings.get(
+                "uvicorn_access_logs_enabled",
+                default_settings["uvicorn_access_logs_enabled"],
+            )
+        ),
     }
 
-    # MCP section
-    mcp_client_fields: list[SettingsField] = []
+    additional["chat_providers"] = _ensure_option_present(additional.get("chat_providers"), current.get("chat_model_provider"))
+    additional["chat_providers"] = _ensure_option_present(additional.get("chat_providers"), current.get("util_model_provider"))
+    additional["chat_providers"] = _ensure_option_present(additional.get("chat_providers"), current.get("browser_model_provider"))
+    additional["embedding_providers"] = _ensure_option_present(additional.get("embedding_providers"), current.get("embed_model_provider"))
+    additional["shell_interfaces"] = _ensure_option_present(additional.get("shell_interfaces"), current.get("shell_interface"))
+    additional["agent_subdirs"] = _ensure_option_present(additional.get("agent_subdirs"), current.get("agent_profile"))
+    additional["knowledge_subdirs"] = _ensure_option_present(additional.get("knowledge_subdirs"), current.get("agent_knowledge_subdir"))
+    additional["stt_models"] = _ensure_option_present(additional.get("stt_models"), current.get("stt_model_size"))
 
-    mcp_client_fields.append(
-        {
-            "id": "mcp_servers_config",
-            "title": "MCP Servers Configuration",
-            "description": "External MCP servers can be configured here.",
-            "type": "button",
-            "value": "Open",
-        }
+    # masked api keys
+    providers = get_providers("chat") + get_providers("embedding")
+    for provider in providers:
+        provider_name = provider["value"]
+        api_key = settings["api_keys"].get(provider_name, models.get_api_key(provider_name))
+        settings["api_keys"][provider_name] = API_KEY_PLACEHOLDER if api_key and api_key != "None" else ""
+
+    # load auth from dotenv
+    out["settings"]["auth_login"] = dotenv.get_dotenv_value(dotenv.KEY_AUTH_LOGIN) or ""
+    out["settings"]["auth_password"] = (
+        PASSWORD_PLACEHOLDER if dotenv.get_dotenv_value(dotenv.KEY_AUTH_PASSWORD) else ""
+    )
+    out["settings"]["rfc_password"] = (
+        PASSWORD_PLACEHOLDER if dotenv.get_dotenv_value(dotenv.KEY_RFC_PASSWORD) else ""
+    )
+    out["settings"]["root_password"] = (
+        PASSWORD_PLACEHOLDER if dotenv.get_dotenv_value(dotenv.KEY_ROOT_PASSWORD) else ""
     )
 
-    mcp_client_fields.append(
-        {
-            "id": "mcp_servers",
-            "title": "MCP Servers",
-            "description": "(JSON list of) >> RemoteServer <<: [name, url, headers, timeout (opt), sse_read_timeout (opt), disabled (opt)] / >> Local Server <<: [name, command, args, env, encoding (opt), encoding_error_handler (opt), disabled (opt)]",
-            "type": "textarea",
-            "value": settings["mcp_servers"],
-            "hidden": True,
-        }
-    )
+    #secrets
+    secrets_manager = get_default_secrets_manager()
+    try:
+        out["settings"]["secrets"] = secrets_manager.get_masked_secrets()
+    except Exception:
+        out["settings"]["secrets"] = ""
 
-    mcp_client_fields.append(
-        {
-            "id": "mcp_client_init_timeout",
-            "title": "MCP Client Init Timeout",
-            "description": "Timeout for MCP client initialization (in seconds). Higher values might be required for complex MCPs, but might also slowdown system startup.",
-            "type": "number",
-            "value": settings["mcp_client_init_timeout"],
-        }
-    )
+    # mask API keys before sending to frontend
+    if isinstance(out["settings"].get("api_keys"), dict):
+        for provider, value in list(out["settings"]["api_keys"].items()):
+            if value:
+                out["settings"]["api_keys"][provider] = API_KEY_PLACEHOLDER
 
-    mcp_client_fields.append(
-        {
-            "id": "mcp_client_tool_timeout",
-            "title": "MCP Client Tool Timeout",
-            "description": "Timeout for MCP client tool execution. Higher values might be required for complex tools, but might also result in long responses with failing tools.",
-            "type": "number",
-            "value": settings["mcp_client_tool_timeout"],
-        }
-    )
-
-    mcp_client_section: SettingsSection = {
-        "id": "mcp_client",
-        "title": "External MCP Servers",
-        "description": "Agent Zero can use external MCP servers, local or remote as tools.",
-        "fields": mcp_client_fields,
-        "tab": "mcp",
-    }
-
-    mcp_server_fields: list[SettingsField] = []
-
-    mcp_server_fields.append(
-        {
-            "id": "mcp_server_enabled",
-            "title": "Enable A0 MCP Server",
-            "description": "Expose Agent Zero as an SSE MCP server. This will make this A0 instance available to MCP clients.",
-            "type": "switch",
-            "value": settings["mcp_server_enabled"],
-        }
-    )
-
-    mcp_server_fields.append(
-        {
-            "id": "mcp_server_token",
-            "title": "MCP Server Token",
-            "description": "Token for MCP server authentication.",
-            "type": "text",
-            "hidden": True,
-            "value": settings["mcp_server_token"],
-        }
-    )
-
-    mcp_server_section: SettingsSection = {
-        "id": "mcp_server",
-        "title": "A0 MCP Server",
-        "description": "Agent Zero can be exposed as an SSE MCP server. See <a href=\"javascript:openModal('settings/mcp/server/example.html')\">connection example</a>.",
-        "fields": mcp_server_fields,
-        "tab": "mcp",
-    }
-
-    # Add the section to the result
-    result: SettingsOutput = {
-        "sections": [
-            agent_section,
-            chat_model_section,
-            util_model_section,
-            embed_model_section,
-            browser_model_section,
-            # memory_section,
-            stt_section,
-            api_keys_section,
-            auth_section,
-            mcp_client_section,
-            mcp_server_section,
-            dev_section,
-        ]
-    }
-    return result
-
+    # normalize certain fields
+    for key, value in list(out["settings"].items()):
+        # convert kwargs dicts to .env format
+        if (key.endswith("_kwargs") or key=="browser_http_headers") and isinstance(value, dict):
+            out["settings"][key] = _dict_to_env(value)
+    return out
 
 def _get_api_key_field(settings: Settings, provider: str, title: str) -> SettingsField:
     key = settings["api_keys"].get(provider, models.get_api_key(provider))
+    # For API keys, use simple asterisk placeholder for existing keys
     return {
         "id": f"api_key_{provider}",
         "title": title,
-        "type": "password",
-        "value": (PASSWORD_PLACEHOLDER if key and key != "None" else ""),
+        "type": "text",
+        "value": (API_KEY_PLACEHOLDER if key and key != "None" else ""),
     }
 
 
-def convert_in(settings: dict) -> Settings:
+def convert_in(settings: Settings) -> Settings:
     current = get_settings()
-    for section in settings["sections"]:
-        if "fields" in section:
-            for field in section["fields"]:
-                if field["value"] != PASSWORD_PLACEHOLDER:
-                    if field["id"].endswith("_kwargs"):
-                        current[field["id"]] = _env_to_dict(field["value"])
-                    elif field["id"].startswith("api_key_"):
-                        current["api_keys"][field["id"]] = field["value"]
-                    else:
-                        current[field["id"]] = field["value"]
+
+    for key, value in settings.items():
+        # Special handling for browser_http_headers and *_kwargs (stored as .env text)
+        if (key == "browser_http_headers" or key.endswith("_kwargs")) and isinstance(value, str):
+            current[key] = _env_to_dict(value)
+            continue
+
+        current[key] = value
     return current
 
 
@@ -822,7 +359,19 @@ def get_settings() -> Settings:
     if not _settings:
         _settings = get_default_settings()
     norm = normalize_settings(_settings)
+    _load_sensitive_settings(norm)
     return norm
+
+
+def reload_settings() -> Settings:
+    global _settings
+    _settings = None
+    return get_settings()
+
+
+def set_runtime_settings_snapshot(settings: Settings) -> None:
+    global _runtime_settings_snapshot
+    _runtime_settings_snapshot = settings.copy()
 
 
 def set_settings(settings: Settings, apply: bool = True):
@@ -832,17 +381,29 @@ def set_settings(settings: Settings, apply: bool = True):
     _write_settings_file(_settings)
     if apply:
         _apply_settings(previous)
+    return reload_settings()
 
 
 def set_settings_delta(delta: dict, apply: bool = True):
     current = get_settings()
     new = {**current, **delta}
-    set_settings(new, apply)  # type: ignore
+    return set_settings(new, apply)  # type: ignore
+
+
+def merge_settings(original: Settings, delta: dict) -> Settings:
+    merged = original.copy()
+    merged.update(delta)
+    return merged
 
 
 def normalize_settings(settings: Settings) -> Settings:
     copy = settings.copy()
     default = get_default_settings()
+
+    # adjust settings values to match current version if needed
+    if "version" not in copy or copy["version"] != default["version"]:
+        _adjust_to_version(copy, default)
+        copy["version"] = default["version"]  # sync version
 
     # remove keys that are not in default
     keys_to_remove = [key for key in copy if key not in default]
@@ -856,6 +417,8 @@ def normalize_settings(settings: Settings) -> Settings:
         else:
             try:
                 copy[key] = type(value)(copy[key])  # type: ignore
+                if isinstance(copy[key], str):
+                    copy[key] = copy[key].strip()  # strip strings
             except (ValueError, TypeError):
                 copy[key] = value  # make default instead
 
@@ -863,6 +426,38 @@ def normalize_settings(settings: Settings) -> Settings:
     copy["mcp_server_token"] = create_auth_token()
 
     return copy
+
+
+def _adjust_to_version(settings: Settings, default: Settings):
+    # starting with 0.9, the default prompt subfolder for agent no. 0 is agent0
+    # switch to agent0 if the old default is used from v0.8
+    if "version" not in settings or settings["version"].startswith("v0.8"):
+        if "agent_profile" not in settings or settings["agent_profile"] == "default":
+            settings["agent_profile"] = "agent0"
+
+
+
+def _load_sensitive_settings(settings: Settings):
+    # load api keys from .env
+    providers = get_providers("chat") + get_providers("embedding")
+    for provider in providers:
+        provider_name = provider["value"]
+        api_key = settings["api_keys"].get(provider_name) or models.get_api_key(provider_name)
+        if api_key and api_key != "None":
+            settings["api_keys"][provider_name] = api_key
+
+    # load auth fields from .env
+    settings["auth_login"] = dotenv.get_dotenv_value(dotenv.KEY_AUTH_LOGIN) or ""
+    settings["auth_password"] = dotenv.get_dotenv_value(dotenv.KEY_AUTH_PASSWORD) or ""
+    settings["rfc_password"] = dotenv.get_dotenv_value(dotenv.KEY_RFC_PASSWORD) or ""
+    settings["root_password"] = dotenv.get_dotenv_value(dotenv.KEY_ROOT_PASSWORD) or ""
+
+    # load secrets raw content
+    secrets_manager = get_default_secrets_manager()
+    try:
+        settings["secrets"] = secrets_manager.read_secrets_raw()
+    except Exception:
+        settings["secrets"] = ""
 
 
 def _read_settings_file() -> Settings | None:
@@ -873,6 +468,7 @@ def _read_settings_file() -> Settings | None:
 
 
 def _write_settings_file(settings: Settings):
+    settings = settings.copy()
     _write_sensitive_settings(settings)
     _remove_sensitive_settings(settings)
 
@@ -888,76 +484,121 @@ def _remove_sensitive_settings(settings: Settings):
     settings["rfc_password"] = ""
     settings["root_password"] = ""
     settings["mcp_server_token"] = ""
+    settings["secrets"] = ""
 
 
 def _write_sensitive_settings(settings: Settings):
     for key, val in settings["api_keys"].items():
-        dotenv.save_dotenv_value(key.upper(), val)
+        if val != API_KEY_PLACEHOLDER:
+            dotenv.save_dotenv_value(f"API_KEY_{key.upper()}", val)
 
     dotenv.save_dotenv_value(dotenv.KEY_AUTH_LOGIN, settings["auth_login"])
-    if settings["auth_password"]:
+    if settings["auth_password"] != PASSWORD_PLACEHOLDER:
         dotenv.save_dotenv_value(dotenv.KEY_AUTH_PASSWORD, settings["auth_password"])
-    if settings["rfc_password"]:
+    if settings["rfc_password"] != PASSWORD_PLACEHOLDER:
         dotenv.save_dotenv_value(dotenv.KEY_RFC_PASSWORD, settings["rfc_password"])
+    if settings["root_password"] != PASSWORD_PLACEHOLDER:
+        if runtime.is_dockerized():
+            dotenv.save_dotenv_value(dotenv.KEY_ROOT_PASSWORD, settings["root_password"])
+            set_root_password(settings["root_password"])
 
-    if settings["root_password"]:
-        dotenv.save_dotenv_value(dotenv.KEY_ROOT_PASSWORD, settings["root_password"])
-    if settings["root_password"]:
-        set_root_password(settings["root_password"])
+    # Handle secrets separately - merge with existing preserving comments/order and support deletions
+    secrets_manager = get_default_secrets_manager()
+    submitted_content = settings["secrets"]
+    secrets_manager.save_secrets_with_merge(submitted_content)
+
 
 
 def get_default_settings() -> Settings:
-    from models import ModelProvider
-
+    gitignore = files.read_file(files.get_abs_path("conf/workdir.gitignore"))
     return Settings(
-        chat_model_provider=ModelProvider.OPENAI.name,
-        chat_model_name="gpt-4.1",
-        chat_model_kwargs={"temperature": "0"},
-        chat_model_ctx_length=100000,
-        chat_model_ctx_history=0.7,
-        chat_model_vision=True,
-        chat_model_rl_requests=0,
-        chat_model_rl_input=0,
-        chat_model_rl_output=0,
-        util_model_provider=ModelProvider.OPENAI.name,
-        util_model_name="gpt-4.1-nano",
-        util_model_ctx_length=100000,
-        util_model_ctx_input=0.7,
-        util_model_kwargs={"temperature": "0"},
-        util_model_rl_requests=0,
-        util_model_rl_input=0,
-        util_model_rl_output=0,
-        embed_model_provider=ModelProvider.HUGGINGFACE.name,
-        embed_model_name="sentence-transformers/all-MiniLM-L6-v2",
-        embed_model_kwargs={},
-        embed_model_rl_requests=0,
-        embed_model_rl_input=0,
-        browser_model_provider=ModelProvider.OPENAI.name,
-        browser_model_name="gpt-4.1",
-        browser_model_vision=True,
-        browser_model_kwargs={"temperature": "0"},
+        version=_get_version(),
+        chat_model_provider=get_default_value("chat_model_provider", "openrouter"),
+        chat_model_name=get_default_value("chat_model_name", "google/gemini-3-pro-preview"),
+        chat_model_api_base=get_default_value("chat_model_api_base", ""),
+        chat_model_kwargs=get_default_value("chat_model_kwargs", {"temperature": "0"}),
+        chat_model_ctx_length=get_default_value("chat_model_ctx_length", 100000),
+        chat_model_ctx_history=get_default_value("chat_model_ctx_history", 0.7),
+        chat_model_vision=get_default_value("chat_model_vision", True),
+        chat_model_rl_requests=get_default_value("chat_model_rl_requests", 0),
+        chat_model_rl_input=get_default_value("chat_model_rl_input", 0),
+        chat_model_rl_output=get_default_value("chat_model_rl_output", 0),
+        util_model_provider=get_default_value("util_model_provider", "openrouter"),
+        util_model_name=get_default_value("util_model_name", "google/gemini-3-flash-preview"),
+        util_model_api_base=get_default_value("util_model_api_base", ""),
+        util_model_ctx_length=get_default_value("util_model_ctx_length", 100000),
+        util_model_ctx_input=get_default_value("util_model_ctx_input", 0.7),
+        util_model_kwargs=get_default_value("util_model_kwargs", {"temperature": "0"}),
+        util_model_rl_requests=get_default_value("util_model_rl_requests", 0),
+        util_model_rl_input=get_default_value("util_model_rl_input", 0),
+        util_model_rl_output=get_default_value("util_model_rl_output", 0),
+        embed_model_provider=get_default_value("embed_model_provider", "huggingface"),
+        embed_model_name=get_default_value("embed_model_name", "sentence-transformers/all-MiniLM-L6-v2"),
+        embed_model_api_base=get_default_value("embed_model_api_base", ""),
+        embed_model_kwargs=get_default_value("embed_model_kwargs", {}),
+        embed_model_rl_requests=get_default_value("embed_model_rl_requests", 0),
+        embed_model_rl_input=get_default_value("embed_model_rl_input", 0),
+        browser_model_provider=get_default_value("browser_model_provider", "openrouter"),
+        browser_model_name=get_default_value("browser_model_name", "google/gemini-3-pro-preview"),
+        browser_model_api_base=get_default_value("browser_model_api_base", ""),
+        browser_model_vision=get_default_value("browser_model_vision", True),
+        browser_model_rl_requests=get_default_value("browser_model_rl_requests", 0),
+        browser_model_rl_input=get_default_value("browser_model_rl_input", 0),
+        browser_model_rl_output=get_default_value("browser_model_rl_output", 0),
+        browser_model_kwargs=get_default_value("browser_model_kwargs", {"temperature": "0"}),
+        browser_http_headers=get_default_value("browser_http_headers", {}),
+        memory_recall_enabled=get_default_value("memory_recall_enabled", True),
+        memory_recall_delayed=get_default_value("memory_recall_delayed", False),
+        memory_recall_interval=get_default_value("memory_recall_interval", 3),
+        memory_recall_history_len=get_default_value("memory_recall_history_len", 10000),
+        memory_recall_memories_max_search=get_default_value("memory_recall_memories_max_search", 12),
+        memory_recall_solutions_max_search=get_default_value("memory_recall_solutions_max_search", 8),
+        memory_recall_memories_max_result=get_default_value("memory_recall_memories_max_result", 5),
+        memory_recall_solutions_max_result=get_default_value("memory_recall_solutions_max_result", 3),
+        memory_recall_similarity_threshold=get_default_value("memory_recall_similarity_threshold", 0.7),
+        memory_recall_query_prep=get_default_value("memory_recall_query_prep", False),
+        memory_recall_post_filter=get_default_value("memory_recall_post_filter", False),
+        memory_memorize_enabled=get_default_value("memory_memorize_enabled", True),
+        memory_memorize_consolidation=get_default_value("memory_memorize_consolidation", True),
+        memory_memorize_replace_threshold=get_default_value("memory_memorize_replace_threshold", 0.9),
         api_keys={},
         auth_login="",
         auth_password="",
         root_password="",
-        agent_prompts_subdir="default",
-        agent_memory_subdir="default",
-        agent_knowledge_subdir="custom",
-        rfc_auto_docker=True,
-        rfc_url="localhost",
+        agent_profile=get_default_value("agent_profile", "agent0"),
+        agent_memory_subdir=get_default_value("agent_memory_subdir", "default"),
+        agent_knowledge_subdir=get_default_value("agent_knowledge_subdir", "custom"),
+        workdir_path=get_default_value("workdir_path", files.get_abs_path_dockerized("usr/workdir")),
+        workdir_show=get_default_value("workdir_show", True),
+        workdir_max_depth=get_default_value("workdir_max_depth", 5),
+        workdir_max_files=get_default_value("workdir_max_files", 20),
+        workdir_max_folders=get_default_value("workdir_max_folders", 20),
+        workdir_max_lines=get_default_value("workdir_max_lines", 250),
+        workdir_gitignore=get_default_value("workdir_gitignore", gitignore),
+        rfc_auto_docker=get_default_value("rfc_auto_docker", True),
+        rfc_url=get_default_value("rfc_url", "localhost"),
         rfc_password="",
-        rfc_port_http=55080,
-        rfc_port_ssh=55022,
-        stt_model_size="base",
-        stt_language="en",
-        stt_silence_threshold=0.3,
-        stt_silence_duration=1000,
-        stt_waiting_timeout=2000,
-        mcp_servers='{\n    "mcpServers": {}\n}',
-        mcp_client_init_timeout=5,
-        mcp_client_tool_timeout=120,
-        mcp_server_enabled=False,
+        rfc_port_http=get_default_value("rfc_port_http", 55080),
+        rfc_port_ssh=get_default_value("rfc_port_ssh", 55022),
+        shell_interface=get_default_value("shell_interface", "local" if runtime.is_dockerized() else "ssh"),
+        websocket_server_restart_enabled=get_default_value("websocket_server_restart_enabled", True),
+        uvicorn_access_logs_enabled=get_default_value("uvicorn_access_logs_enabled", False),
+        stt_model_size=get_default_value("stt_model_size", "base"),
+        stt_language=get_default_value("stt_language", "en"),
+        stt_silence_threshold=get_default_value("stt_silence_threshold", 0.3),
+        stt_silence_duration=get_default_value("stt_silence_duration", 1000),
+        stt_waiting_timeout=get_default_value("stt_waiting_timeout", 2000),
+        tts_kokoro=get_default_value("tts_kokoro", True),
+        mcp_servers=get_default_value("mcp_servers", '{\n    "mcpServers": {}\n}'),
+        mcp_client_init_timeout=get_default_value("mcp_client_init_timeout", 10),
+        mcp_client_tool_timeout=get_default_value("mcp_client_tool_timeout", 120),
+        mcp_server_enabled=get_default_value("mcp_server_enabled", False),
         mcp_server_token=create_auth_token(),
+        a2a_server_enabled=get_default_value("a2a_server_enabled", False),
+        variables="",
+        secrets="",
+        litellm_global_kwargs=get_default_value("litellm_global_kwargs", {}),
+        update_check_enabled=get_default_value("update_check_enabled", True),
     )
 
 
@@ -968,7 +609,7 @@ def _apply_settings(previous: Settings | None):
         from initialize import initialize_agent
 
         config = initialize_agent()
-        for ctx in AgentContext._contexts.values():
+        for ctx in AgentContext.all():
             ctx.config = config  # reinitialize context config with new settings
             # apply config to agents
             agent = ctx.agent0
@@ -1000,18 +641,24 @@ def _apply_settings(previous: Settings | None):
                 PrintStyle(
                     background_color="black", font_color="white", padding=True
                 ).print("Updating MCP config...")
-                AgentContext.log_to_all(
-                    type="info", content="Updating MCP settings...", temp=True
+                NotificationManager.send_notification(
+                    type=NotificationType.INFO,
+                    priority=NotificationPriority.NORMAL,
+                    message="Updating MCP settings...",
+                    display_time=999,
+                    group="settings-mcp"
                 )
 
                 mcp_config = MCPConfig.get_instance()
                 try:
                     MCPConfig.update(mcp_servers)
                 except Exception as e:
-                    AgentContext.log_to_all(
-                        type="error",
-                        content=f"Failed to update MCP settings: {e}",
-                        temp=False,
+                    
+                    NotificationManager.send_notification(
+                        type=NotificationType.ERROR,
+                        priority=NotificationPriority.HIGH,
+                        message="Failed to update MCP settings",
+                        detail=str(e),                        
                     )
                     (
                         PrintStyle(
@@ -1032,8 +679,11 @@ def _apply_settings(previous: Settings | None):
                         background_color="#334455", font_color="white", padding=False
                     ).print(mcp_config.model_dump_json())
                 )
-                AgentContext.log_to_all(
-                    type="info", content="Finished updating MCP settings.", temp=True
+                NotificationManager.send_notification(
+                    type=NotificationType.INFO,
+                    priority=NotificationPriority.NORMAL,
+                    message="Finished updating MCP settings.",
+                    group="settings-mcp"
                 )
 
             task2 = defer.DeferredTask().start_task(
@@ -1041,58 +691,97 @@ def _apply_settings(previous: Settings | None):
             )  # TODO overkill, replace with background task
 
         # update token in mcp server
-        current_token = create_auth_token() #TODO - ugly, token in settings is generated from dotenv and does not always correspond
-        if (
-            not previous
-            or current_token != previous["mcp_server_token"]
-        ):
+        current_token = (
+            create_auth_token()
+        )  # TODO - ugly, token in settings is generated from dotenv and does not always correspond
+        if not previous or current_token != previous["mcp_server_token"]:
 
             async def update_mcp_token(token: str):
                 from python.helpers.mcp_server import DynamicMcpProxy
+
                 DynamicMcpProxy.get_instance().reconfigure(token=token)
 
             task3 = defer.DeferredTask().start_task(
                 update_mcp_token, current_token
             )  # TODO overkill, replace with background task
 
+        # update token in a2a server
+        if not previous or current_token != previous["mcp_server_token"]:
+
+            async def update_a2a_token(token: str):
+                from python.helpers.fasta2a_server import DynamicA2AProxy
+
+                DynamicA2AProxy.get_instance().reconfigure(token=token)
+
+            task4 = defer.DeferredTask().start_task(
+                update_a2a_token, current_token
+            )  # TODO overkill, replace with background task
+
 
 def _env_to_dict(data: str):
-    env_dict = {}
-    line_pattern = re.compile(r"\s*([^#][^=]*)\s*=\s*(.*)")
+    result = {}
     for line in data.splitlines():
-        match = line_pattern.match(line)
-        if match:
-            key, value = match.groups()
-            # Remove optional surrounding quotes (single or double)
-            value = value.strip().strip('"').strip("'")
-            env_dict[key.strip()] = value
-    return env_dict
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        
+        if '=' not in line:
+            continue
+            
+        key, value = line.split('=', 1)
+        key = key.strip()
+        value = value.strip()
+        
+        # If quoted, treat as string
+        if value.startswith('"') and value.endswith('"'):
+            result[key] = value[1:-1].replace('\\"', '"')  # Unescape quotes
+        elif value.startswith("'") and value.endswith("'"):
+            result[key] = value[1:-1].replace("\\'", "'")  # Unescape quotes
+        else:
+            # Not quoted, try JSON parse
+            try:
+                result[key] = json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                result[key] = value
+    
+    return result
 
 
 def _dict_to_env(data_dict):
     lines = []
     for key, value in data_dict.items():
-        if "\n" in value:
-            value = f"'{value}'"
-        elif " " in value or value == "" or any(c in value for c in "\"'"):
-            value = f'"{value}"'
-        lines.append(f"{key}={value}")
+        if isinstance(value, str):
+            # Quote strings and escape internal quotes
+            escaped_value = value.replace('"', '\\"')
+            lines.append(f'{key}="{escaped_value}"')
+        elif isinstance(value, (dict, list, bool)) or value is None:
+            # Serialize as unquoted JSON
+            lines.append(f'{key}={json.dumps(value, separators=(",", ":"))}')
+        else:
+            # Numbers and other types as unquoted strings
+            lines.append(f'{key}={value}')
+    
     return "\n".join(lines)
 
 
 def set_root_password(password: str):
     if not runtime.is_dockerized():
         raise Exception("root password can only be set in dockerized environments")
-    subprocess.run(f"echo 'root:{password}' | chpasswd", shell=True, check=True)
+    _result = subprocess.run(
+        ["chpasswd"],
+        input=f"root:{password}".encode(),
+        capture_output=True,
+        check=True,
+    )
     dotenv.save_dotenv_value(dotenv.KEY_ROOT_PASSWORD, password)
 
 
 def get_runtime_config(set: Settings):
     if runtime.is_dockerized():
         return {
+            "code_exec_ssh_enabled": set["shell_interface"] == "ssh",
             "code_exec_ssh_addr": "localhost",
             "code_exec_ssh_port": 22,
-            "code_exec_http_port": 80,
             "code_exec_ssh_user": "root",
         }
     else:
@@ -1104,20 +793,24 @@ def get_runtime_config(set: Settings):
         if host.endswith("/"):
             host = host[:-1]
         return {
+            "code_exec_ssh_enabled": set["shell_interface"] == "ssh",
             "code_exec_ssh_addr": host,
             "code_exec_ssh_port": set["rfc_port_ssh"],
-            "code_exec_http_port": set["rfc_port_http"],
             "code_exec_ssh_user": "root",
         }
 
 
 def create_auth_token() -> str:
+    runtime_id = runtime.get_persistent_id()
     username = dotenv.get_dotenv_value(dotenv.KEY_AUTH_LOGIN) or ""
     password = dotenv.get_dotenv_value(dotenv.KEY_AUTH_PASSWORD) or ""
-    if not username or not password:
-        return "0"
     # use base64 encoding for a more compact token with alphanumeric chars
-    hash_bytes = hashlib.sha256(f"{username}:{password}".encode()).digest()
+    hash_bytes = hashlib.sha256(f"{runtime_id}:{username}:{password}".encode()).digest()
     # encode as base64 and remove any non-alphanumeric chars (like +, /, =)
     b64_token = base64.urlsafe_b64encode(hash_bytes).decode().replace("=", "")
     return b64_token[:16]
+
+
+def _get_version():
+    return git.get_version()
+

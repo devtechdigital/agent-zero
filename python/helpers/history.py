@@ -15,7 +15,7 @@ CURRENT_TOPIC_RATIO = 0.5
 HISTORY_TOPIC_RATIO = 0.3
 HISTORY_BULK_RATIO = 0.2
 TOPIC_COMPRESS_RATIO = 0.65
-LARGE_MESSAGE_TO_TOPIC_RATIO = 0.25
+LARGE_MESSAGE_TO_TOPIC_RATIO = 0.5
 RAW_MESSAGE_OUTPUT_TEXT_TRIM = 100
 
 
@@ -295,6 +295,7 @@ class History(Record):
     def __init__(self, agent):
         from agent import Agent
 
+        self.counter = 0
         self.bulks: list[Bulk] = []
         self.topics: list[Topic] = []
         self.current = Topic(history=self)
@@ -324,6 +325,7 @@ class History(Record):
     def add_message(
         self, ai: bool, content: MessageContent, tokens: int = 0
     ) -> Message:
+        self.counter += 1
         return self.current.add_message(ai, content=content, tokens=tokens)
 
     def new_topic(self):
@@ -340,6 +342,7 @@ class History(Record):
 
     @staticmethod
     def from_dict(data: dict, history: "History"):
+        history.counter = data.get("counter", 0)
         history.bulks = [Bulk.from_dict(b, history=history) for b in data["bulks"]]
         history.topics = [Topic.from_dict(t, history=history) for t in data["topics"]]
         history.current = Topic.from_dict(data["current"], history=history)
@@ -348,6 +351,7 @@ class History(Record):
     def to_dict(self):
         return {
             "_cls": "History",
+            "counter": self.counter,
             "bulks": [b.to_dict() for b in self.bulks],
             "topics": [t.to_dict() for t in self.topics],
             "current": self.current.to_dict(),
@@ -515,12 +519,13 @@ def group_messages_abab(messages: list[BaseMessage]) -> list[BaseMessage]:
 def output_langchain(messages: list[OutputMessage]):
     result = []
     for m in messages:
+        content = _output_content_langchain(content=m["content"])
+        if not content or (isinstance(content, str) and not content.strip()):
+            continue # skip empty messages, models 
         if m["ai"]:
-            # result.append(AIMessage(content=serialize_content(m["content"])))
-            result.append(AIMessage(_output_content_langchain(content=m["content"])))  # type: ignore
+            result.append(AIMessage(content))  # type: ignore
         else:
-            # result.append(HumanMessage(content=serialize_content(m["content"])))
-            result.append(HumanMessage(_output_content_langchain(content=m["content"])))  # type: ignore
+            result.append(HumanMessage(content))  # type: ignore
     # ensure message type alternation
     result = group_messages_abab(result)
     return result
@@ -534,10 +539,17 @@ def _merge_outputs(a: MessageContent, b: MessageContent) -> MessageContent:
     if isinstance(a, str) and isinstance(b, str):
         return a + "\n" + b
 
-    if not isinstance(a, list):
-        a = [a]
-    if not isinstance(b, list):
-        b = [b]
+    def make_list(obj: MessageContent) -> list[MessageContent]:
+        if isinstance(obj, list):
+            return obj  # type: ignore
+        if isinstance(obj, dict):
+            return [obj]
+        if isinstance(obj, str):
+            return [{"type": "text", "text": obj}]
+        return [obj]
+
+    a = make_list(a)
+    b = make_list(b)
 
     return cast(MessageContent, a + b)
 

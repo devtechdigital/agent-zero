@@ -9,13 +9,6 @@ const backdrop = document.createElement("div");
 backdrop.className = "modal-backdrop";
 backdrop.style.display = "none";
 backdrop.style.backdropFilter = "blur(5px)";
-
-// Make sure we only close when clicking directly on the backdrop, not its children
-backdrop.addEventListener("click", (event) => {
-  if (event.target === backdrop) {
-    closeModal();
-  }
-});
 document.body.appendChild(backdrop);
 
 // Function to update z-index for all modals and backdrop
@@ -49,18 +42,22 @@ function updateModalZIndexes() {
 }
 
 // Function to create a new modal element
-function createModalElement(name) {
+function createModalElement(path) {
   // Create modal element
   const newModal = document.createElement("div");
   newModal.className = "modal";
-  newModal.modalName = name; // save name to the object
+  newModal.path = path; // save name to the object
 
-  // Add click handler to the modal element to close when clicking outside content
-  newModal.addEventListener("click", (event) => {
-    // Only close if clicking directly on the modal container, not its content
-    if (event.target === newModal) {
+  // Add click handlers to only close modal if both mousedown and mouseup are on the modal container
+  let mouseDownTarget = null;
+  newModal.addEventListener("mousedown", (event) => {
+    mouseDownTarget = event.target;
+  });
+  newModal.addEventListener("mouseup", (event) => {
+    if (event.target === newModal && mouseDownTarget === newModal) {
       closeModal();
     }
+    mouseDownTarget = null;
   });
 
 
@@ -74,6 +71,7 @@ function createModalElement(name) {
       <div class="modal-scroll">
         <div class="modal-bd"></div>
       </div>
+      <div class="modal-footer-slot" style="display: none;"></div>
     </div>
   `;
 
@@ -92,21 +90,26 @@ function createModalElement(name) {
   updateModalZIndexes();
 
   return {
+    path: path,
     element: newModal,
     title: newModal.querySelector(".modal-title"),
     body: newModal.querySelector(".modal-bd"),
     close: close_button,
+    footerSlot: newModal.querySelector(".modal-footer-slot"),
+    inner: newModal.querySelector(".modal-inner"),
     styles: [],
     scripts: [],
+    beforeClose: null,
   };
 }
 
 // Function to open modal with content from URL
-export function openModal(modalPath) {
+export function openModal(modalPath, beforeClose = null) {
   return new Promise((resolve) => {
     try {
       // Create new modal instance
-      const modal = createModalElement();
+      const modal = createModalElement(modalPath);
+      modal.beforeClose = beforeClose;
 
       new MutationObserver(
         (_, o) =>
@@ -128,6 +131,25 @@ export function openModal(modalPath) {
         .then((doc) => {
           // Set the title from the document
           modal.title.innerHTML = doc.title || modalPath;
+          if (doc.html && doc.html.classList) {
+            const inner = modal.element.querySelector(".modal-inner");
+            if (inner) inner.classList.add(...doc.html.classList);
+          }
+          if (doc.body && doc.body.classList) {
+            modal.body.classList.add(...doc.body.classList);
+          }
+          
+          // Some modals have a footer. Check if it exists and move it to footer slot
+          // Use requestAnimationFrame to let Alpine mount the component first
+          requestAnimationFrame(() => {
+            const componentFooter = modal.body.querySelector('[data-modal-footer]');
+            if (componentFooter && modal.footerSlot) {
+              // Move footer outside modal-scroll scrollable area
+              modal.footerSlot.appendChild(componentFooter);
+              modal.footerSlot.style.display = 'block';
+              modal.inner.classList.add('modal-with-footer');
+            }
+          });
         })
         .catch((error) => {
           console.error("Error loading modal content:", error);
@@ -136,6 +158,7 @@ export function openModal(modalPath) {
 
       // Add modal to stack and show it
       // Add modal to stack
+      modal.path = modalPath;
       modalStack.push(modal);
       modal.element.classList.add("show");
       document.body.style.overflow = "hidden";
@@ -150,65 +173,95 @@ export function openModal(modalPath) {
 }
 
 // Function to close modal
-export function closeModal(modalName = null) {
+export function closeModal(modalPath = null) {
   if (modalStack.length === 0) return;
 
   let modalIndex = modalStack.length - 1; // Default to last modal
   let modal;
 
-  if (modalName) {
+  if (modalPath) {
     // Find the modal with the specified name in the stack
-    modalIndex = modalStack.findIndex((modal) => modal.modalName === modalName);
+    modalIndex = modalStack.findIndex((modal) => modal.path === modalPath);
     if (modalIndex === -1) return; // Modal not found in stack
 
     // Get the modal from stack at the found index
     modal = modalStack[modalIndex];
-    // Remove the modal from stack
-    modalStack.splice(modalIndex, 1);
   } else {
-    // Just remove the last modal
-    modal = modalStack.pop();
+    // Just get the last modal (removal happens after beforeClose)
+    modal = modalStack[modalStack.length - 1];
   }
 
-  // Remove modal-specific styles and scripts immediately
-  modal.styles.forEach((styleId) => {
-    document.querySelector(`[data-modal-style="${styleId}"]`)?.remove();
-  });
-  modal.scripts.forEach((scriptId) => {
-    document.querySelector(`[data-modal-script="${scriptId}"]`)?.remove();
-  });
+  const canClose = async () => {
+    if (!modal.beforeClose) return true;
+    try {
+      const result = await Promise.resolve(modal.beforeClose());
+      return result !== false;
+    } catch (error) {
+      console.error("Error in beforeClose handler:", error);
+      return true;
+    }
+  };
 
-  // First remove the show class to trigger the transition
-  modal.element.classList.remove("show");
+  return Promise.resolve(canClose()).then((shouldClose) => {
+    if (!shouldClose) return false;
 
-  // Remove the modal element from DOM after animation
-  modal.element.addEventListener(
-    "transitionend",
-    () => {
-      // Make sure the modal is completely removed from the DOM
-      if (modal.element.parentNode) {
-        modal.element.parentNode.removeChild(modal.element);
-      }
-    },
-    { once: true }
-  );
+    if (modalPath) {
+      // Remove the modal from stack after beforeClose check
+      modalStack.splice(modalIndex, 1);
+    } else {
+      modalStack.pop();
+    }
 
-  // Fallback in case the transition event doesn't fire
-  setTimeout(() => {
+    // Remove modal-specific styles and scripts immediately
+    modal.styles.forEach((styleId) => {
+      document.querySelector(`[data-modal-style="${styleId}"]`)?.remove();
+    });
+    modal.scripts.forEach((scriptId) => {
+      document.querySelector(`[data-modal-script="${scriptId}"]`)?.remove();
+    });
+
+    // First remove the show class to trigger the transition
+    modal.element.classList.remove("show");
+
+  // commented out to prevent race conditions
+
+  // // Remove the modal element from DOM after animation
+  // modal.element.addEventListener(
+  //   "transitionend",
+  //   () => {
+  //     // Make sure the modal is completely removed from the DOM
+  //     if (modal.element.parentNode) {
+  //       modal.element.parentNode.removeChild(modal.element);
+  //     }
+  //   },
+  //   { once: true }
+  // );
+
+  // // Fallback in case the transition event doesn't fire
+  // setTimeout(() => {
+  //   if (modal.element.parentNode) {
+  //     modal.element.parentNode.removeChild(modal.element);
+  //   }
+  // }, 500); // 500ms should be enough for the transition to complete
+
+    // remove immediately
     if (modal.element.parentNode) {
       modal.element.parentNode.removeChild(modal.element);
     }
-  }, 500); // 500ms should be enough for the transition to complete
 
-  // Handle backdrop visibility and body overflow
-  if (modalStack.length === 0) {
-    // Hide backdrop when no modals are left
-    backdrop.style.display = "none";
-    document.body.style.overflow = "";
-  } else {
-    // Update modal z-indexes
-    updateModalZIndexes();
-  }
+
+    // Handle backdrop visibility and body overflow
+    if (modalStack.length === 0) {
+      // Hide backdrop when no modals are left
+      backdrop.style.display = "none";
+      document.body.style.overflow = "";
+    } else {
+      // Update modal z-indexes
+      updateModalZIndexes();
+    }
+
+    return true;
+  });
 }
 
 // Function to scroll to element by ID within the last modal

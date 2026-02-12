@@ -9,7 +9,7 @@ from initialize import initialize_agent
 
 from python.helpers.log import Log, LogItem
 
-CHATS_FOLDER = "tmp/chats"
+CHATS_FOLDER = "usr/chats"
 LOG_SIZE = 1000
 CHAT_FILE_NAME = "chat.json"
 
@@ -26,14 +26,29 @@ def get_chat_folder_path(ctxid: str):
     """
     return files.get_abs_path(CHATS_FOLDER, ctxid)
 
+def get_chat_msg_files_folder(ctxid: str):
+    return files.get_abs_path(get_chat_folder_path(ctxid), "messages")
 
 def save_tmp_chat(context: AgentContext):
     """Save context to the chats folder"""
+    # Skip saving BACKGROUND contexts as they should be ephemeral
+    if context.type == AgentContextType.BACKGROUND:
+        return
+
     path = _get_chat_file_path(context.id)
     files.make_dirs(path)
     data = _serialize_context(context)
     js = _safe_json_serialize(data, ensure_ascii=False)
     files.write_file(path, js)
+
+
+def save_tmp_chats():
+    """Save all contexts to the chats folder"""
+    for context in AgentContext.all():
+        # Skip BACKGROUND contexts as they should be ephemeral
+        if context.type == AgentContextType.BACKGROUND:
+            continue
+        save_tmp_chat(context)
 
 
 def load_tmp_chats():
@@ -94,6 +109,12 @@ def remove_chat(ctxid):
     files.delete_dir(path)
 
 
+def remove_msg_files(ctxid):
+    """Remove all message files for a chat or task context"""
+    path = get_chat_msg_files_folder(ctxid)
+    files.delete_dir(path)
+
+
 def _serialize_context(context: AgentContext):
     # serialize agents
     agents = []
@@ -102,16 +123,22 @@ def _serialize_context(context: AgentContext):
         agents.append(_serialize_agent(agent))
         agent = agent.data.get(Agent.DATA_NAME_SUBORDINATE, None)
 
+
+    data = {k: v for k, v in context.data.items() if not k.startswith("_")}
+    output_data = {k: v for k, v in context.output_data.items() if not k.startswith("_")}
+
     return {
         "id": context.id,
         "name": context.name,
         "created_at": (
-            context.created_at.isoformat() if context.created_at
+            context.created_at.isoformat()
+            if context.created_at
             else datetime.fromtimestamp(0).isoformat()
         ),
         "type": context.type.value,
         "last_message": (
-            context.last_message.isoformat() if context.last_message
+            context.last_message.isoformat()
+            if context.last_message
             else datetime.fromtimestamp(0).isoformat()
         ),
         "agents": agents,
@@ -119,6 +146,8 @@ def _serialize_context(context: AgentContext):
             context.streaming_agent.number if context.streaming_agent else 0
         ),
         "log": _serialize_log(context.log),
+        "data": data,
+        "output_data": output_data,
     }
 
 
@@ -135,13 +164,17 @@ def _serialize_agent(agent: Agent):
 
 
 def _serialize_log(log: Log):
+    # Guard against concurrent log mutations while serializing.
+    with log._lock:
+        logs = [item.output() for item in log.logs[-LOG_SIZE:]]  # serialize LogItem objects
+        guid = log.guid
+        progress = log.progress
+        progress_no = log.progress_no
     return {
-        "guid": log.guid,
-        "logs": [
-            item.output() for item in log.logs[-LOG_SIZE:]
-        ],  # serialize LogItem objects
-        "progress": log.progress,
-        "progress_no": log.progress_no,
+        "guid": guid,
+        "logs": logs,
+        "progress": progress,
+        "progress_no": progress_no,
     }
 
 
@@ -167,6 +200,8 @@ def _deserialize_context(data):
         ),
         log=log,
         paused=False,
+        data=data.get("data", {}),
+        output_data=data.get("output_data", {}),
         # agent0=agent0,
         # streaming_agent=straming_agent,
     )
@@ -174,7 +209,7 @@ def _deserialize_context(data):
     agents = data.get("agents", [])
     agent0 = _deserialize_agents(agents, config, context)
     streaming_agent = agent0
-    while streaming_agent.number != data.get("streaming_agent", 0):
+    while streaming_agent and streaming_agent.number != data.get("streaming_agent", 0):
         streaming_agent = streaming_agent.data.get(Agent.DATA_NAME_SUBORDINATE, None)
 
     context.agent0 = agent0
@@ -231,6 +266,9 @@ def _deserialize_log(data: dict[str, Any]) -> "Log":
     # Deserialize the list of LogItem objects
     i = 0
     for item_data in data.get("logs", []):
+        agentno = item_data.get("agentno")
+        if agentno is None:
+            agentno = item_data.get("agent_number", 0)
         log.logs.append(
             LogItem(
                 log=log,  # restore the log reference
@@ -239,7 +277,9 @@ def _deserialize_log(data: dict[str, Any]) -> "Log":
                 heading=item_data.get("heading", ""),
                 content=item_data.get("content", ""),
                 kvps=OrderedDict(item_data["kvps"]) if item_data["kvps"] else None,
-                temp=item_data.get("temp", False),
+                timestamp=item_data.get("timestamp", 0.0),
+                agentno=agentno,
+                id=item_data.get("id"),
             )
         )
         log.updates.append(i)
