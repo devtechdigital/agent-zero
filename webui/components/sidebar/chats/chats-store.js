@@ -12,12 +12,14 @@ import {
 import { store as notificationStore } from "/components/notifications/notification-store.js";
 import { store as tasksStore } from "/components/sidebar/tasks/tasks-store.js";
 import { store as syncStore } from "/components/sync/sync-store.js";
+import { store as chatInputStore } from "/components/chat/input/input-store.js";
 
 const model = {
   contexts: [],
   selected: "",
   selectedContext: null,
   loggedIn: false,
+  expandedParents: {},
 
   // for convenience
   getSelectedChatId() {
@@ -30,6 +32,18 @@ const model = {
 
   init() {
     this.loggedIn = Boolean(window.runtimeInfo && window.runtimeInfo.loggedIn);
+
+    // URL parameter takes priority (e.g. ?ctxid=abc from "open in new window")
+    const urlParams = new URL(window.location.href).searchParams;
+    const urlCtxId = urlParams.get("ctxid");
+    if (urlCtxId) {
+      const cleanUrl = new URL(window.location.href);
+      cleanUrl.searchParams.delete("ctxid");
+      window.history.replaceState({}, "", cleanUrl);
+      this.selectChat(urlCtxId);
+      return;
+    }
+
     // Initialize from sessionStorage
     const lastSelectedChat = sessionStorage.getItem("lastSelectedChat");
     if (lastSelectedChat) {
@@ -40,7 +54,7 @@ const model = {
   // Update contexts from polling
   applyContexts(contextsList) {
     // Sort by created_at time (newer first)
-    this.contexts = contextsList.sort(
+    this.contexts = [...contextsList].sort(
       (a, b) => (b.created_at || 0) - (a.created_at || 0)
     );
 
@@ -51,8 +65,47 @@ const model = {
       const updated = this.contexts.find((ctx) => ctx.id === selectedId);
       if (updated) {
         this.selectedContext = updated;
+        const nextExpandedParents = { ...this.expandedParents };
+        if (updated.parent_context_id) {
+          nextExpandedParents[updated.parent_context_id] = true;
+        } else if (
+          this.hasChildren(selectedId) &&
+          nextExpandedParents[selectedId] === undefined
+        ) {
+          nextExpandedParents[selectedId] = true;
+        }
+        this.expandedParents = nextExpandedParents;
       }
     }
+  },
+
+  topLevelContexts() {
+    return this.contexts.filter((ctx) => !ctx?.parent_context_id);
+  },
+
+  childContexts(parentId) {
+    return this.contexts.filter((ctx) => ctx?.parent_context_id === parentId);
+  },
+
+  hasChildren(parentId) {
+    return this.childContexts(parentId).length > 0;
+  },
+
+  isExpanded(parentId) {
+    return Boolean(this.expandedParents?.[parentId]);
+  },
+
+  toggleChildren(parentId) {
+    if (!parentId || !this.hasChildren(parentId)) return;
+    this.expandedParents = {
+      ...this.expandedParents,
+      [parentId]: !this.expandedParents?.[parentId],
+    };
+  },
+
+  displayName(context) {
+    if (!context) return "";
+    return context.parent_context_label || context.name || `Chat #${context.no}`;
   },
 
   // Select a chat
@@ -86,8 +139,6 @@ const model = {
       return;
     }
 
-    console.log("Deleting chat with ID:", id);
-
     try {
       // Switch to another context if deleting current
       if (this.selected === id) {
@@ -99,11 +150,6 @@ const model = {
 
       // Update the UI - remove from contexts
       const updatedContexts = this.contexts.filter((ctx) => ctx.id !== id);
-      console.log(
-        "Updated contexts after deletion:",
-        JSON.stringify(updatedContexts.map((c) => ({ id: c.id, name: c.name })))
-      );
-
       // Force UI update by creating a new array
       this.contexts = [...updatedContexts];
 
@@ -162,13 +208,15 @@ const model = {
       });
 
       if (response.ok) {
-        this.selectChat(response.ctxid);
-        return;
+        await this.selectChat(response.ctxid);
+        document.dispatchEvent(new CustomEvent("chat-created", { detail: { ctxid: response.ctxid } }));
+        return response.ctxid;
       }
 
     } catch (e) {
       toastFetchError("Error creating new chat", e);
     }
+    return null;
   },
 
   deselectChat(){

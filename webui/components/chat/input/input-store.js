@@ -1,13 +1,71 @@
 import { createStore } from "/js/AlpineStore.js";
 import * as shortcuts from "/js/shortcuts.js";
 import { store as fileBrowserStore } from "/components/modals/file-browser/file-browser-store.js";
+import { openLatest as openLatestSurface } from "/js/surfaces.js";
 import { store as messageQueueStore } from "/components/chat/message-queue/message-queue-store.js";
 import { store as attachmentsStore } from "/components/chat/attachments/attachmentsStore.js";
 import { store as chatsStore } from "/components/sidebar/chats/chats-store.js";
 
+const ICON_MARKER_RE = /icon:\/\/([a-zA-Z0-9_]+)(\[(?:\\.|[^\]])*\])?/g;
+
+function escapeHTML(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function unescapeIconTooltip(block) {
+  if (!block) return "";
+  return block
+    .slice(1, -1)
+    .replace(/\\\[/g, "[")
+    .replace(/\\\]/g, "]")
+    .replace(/\\\\/g, "\\");
+}
+
+function convertIconMarkersToHtml(value) {
+  const text = String(value ?? "");
+  let html = "";
+  let lastIndex = 0;
+
+  text.replace(ICON_MARKER_RE, (match, iconName, tooltipBlock, offset) => {
+    html += escapeHTML(text.slice(lastIndex, offset));
+    const tooltip = unescapeIconTooltip(tooltipBlock) || iconName;
+    html += (
+      `<span class="icon material-symbols-outlined chat-input-progress-icon" ` +
+      `title="${escapeHTML(tooltip)}">${escapeHTML(iconName)}</span>`
+    );
+    lastIndex = offset + match.length;
+    return match;
+  });
+
+  html += escapeHTML(text.slice(lastIndex));
+  return html;
+}
+
 const model = {
   paused: false,
   message: "",
+  _history: [],
+  _historyIndex: null,
+  _draft: "",
+  _historyCtxid: null,
+  /** Composer + menu (bottom actions moved into dropdown) */
+  chatMoreMenuOpen: false,
+  progressText: "",
+  progressActive: false,
+  _caretIndex: 0,
+
+  toggleChatMoreMenu() {
+    this.chatMoreMenuOpen = !this.chatMoreMenuOpen;
+  },
+
+  closeChatMoreMenu() {
+    this.chatMoreMenuOpen = false;
+  },
 
   _getSendState() {
     const hasInput = this.message.trim() || attachmentsStore?.attachments?.length > 0;
@@ -20,9 +78,31 @@ const model = {
   },
 
   get inputPlaceholder() {
+    if (!chatsStore.selected) return "Ask anything to start a new chat";
     const state = this._getSendState();
     if (state === "all") return "Press Enter to send queued messages";
+    if (this.showProgressPlaceholder) return "";
     return "Type your message here...";
+  },
+
+  get isCodeContext() {
+    return this._isCaretInsideFence(this.message, this._caretIndex);
+  },
+
+  get showProgressPlaceholder() {
+    return (
+      !!chatsStore.selected &&
+      this._getSendState() !== "all" &&
+      !!this.progressText &&
+      !this.message
+    );
+  },
+
+  get progressPlaceholderHtml() {
+    return (
+      `<span class="chat-input-progress-cue">|&gt;</span> ` +
+      convertIconMarkersToHtml(this.progressText)
+    );
   },
 
   // Computed: send button icon type
@@ -30,7 +110,7 @@ const model = {
     const state = this._getSendState();
     if (state === "all") return "send_and_archive";
     if (state === "queue") return "schedule_send";
-    return "send";
+    return "arrow_forward";
   },
 
   // Computed: send button CSS class
@@ -55,17 +135,66 @@ const model = {
   },
 
   async sendMessage() {
+    // Capture sent prompt to per-chat history (bash-style)
+    try { this._pushHistory(this.message); } catch (_e) { /* ignore */ }
+
+    if (!chatsStore.selected && (this.message.trim() || attachmentsStore?.attachments?.length > 0)) {
+      const ctxid = await chatsStore.newChat();
+      if (!ctxid && !chatsStore.selected) return;
+    }
+
     // Delegate to the global function
     if (globalThis.sendMessage) {
       await globalThis.sendMessage();
     }
   },
 
-  adjustTextareaHeight() {
-    const chatInput = document.getElementById("chat-input");
-    if (chatInput) {
+  _composerTextareas(target = null) {
+    if (target?.tagName === "TEXTAREA") return [target];
+    return ["chat-input"]
+      .map((id) => document.getElementById(id))
+      .filter(Boolean);
+  },
+
+  _activeTextarea() {
+    const active = document.activeElement;
+    if (active?.id === "chat-input") {
+      return active;
+    }
+    return document.getElementById("chat-input");
+  },
+
+  _syncCaretFromEvent($event = null) {
+    const ta = ($event && $event.target?.tagName === "TEXTAREA")
+      ? $event.target
+      : this._activeTextarea();
+    if (!ta) {
+      this._caretIndex = this.message.length;
+      return;
+    }
+    this._caretIndex = Number.isFinite(ta.selectionStart) ? ta.selectionStart : this.message.length;
+  },
+
+  _isCaretInsideFence(text, index) {
+    const source = String(text || "");
+    const caret = Math.max(0, Math.min(source.length, Number(index) || 0));
+    const matches = source.slice(0, caret).match(/```/g);
+    return Boolean(matches && matches.length % 2 === 1);
+  },
+
+  handleInput($event) {
+    this._syncCaretFromEvent($event);
+    this.adjustTextareaHeight($event);
+  },
+
+  adjustTextareaHeight($event = null) {
+    const target = $event?.target || null;
+    for (const chatInput of this._composerTextareas(target)) {
+      if (!this.message) chatInput.value = "";
       chatInput.style.height = "auto";
       chatInput.style.height = chatInput.scrollHeight + "px";
+      // pick up any layout shift triggered by the height assignment
+      chatInput.style.height = Math.max(chatInput.scrollHeight, parseInt(chatInput.style.height)) + "px";
     }
   },
 
@@ -98,9 +227,10 @@ const model = {
 
   async loadKnowledge() {
     try {
-      const resp = await shortcuts.callJsonApi("/knowledge_path_get", {
-        ctxid: shortcuts.getCurrentContextId(),
-      });
+      const resp = await shortcuts.callJsonApi(
+        "/plugins/_memory/knowledge_path_get",
+        { ctxid: shortcuts.getCurrentContextId() }
+      );
       if (!resp.ok) throw new Error("Error getting knowledge path");
       const path = resp.path;
 
@@ -118,7 +248,7 @@ const model = {
       });
 
       // then reindex knowledge
-      await globalThis.sendJsonData("/knowledge_reindex", {
+      await globalThis.sendJsonData("/plugins/_memory/knowledge_reindex", {
         ctxid: shortcuts.getCurrentContextId(),
       });
 
@@ -189,21 +319,197 @@ const model = {
 
   async browseFiles(path) {
     if (!path) {
-      try {
-        const resp = await shortcuts.callJsonApi("/chat_files_path_get", {
-          ctxid: shortcuts.getCurrentContextId(),
-        });
-        if (resp.ok) path = resp.path;
-      } catch (_e) {
-        console.error("Error getting chat files path", _e);
+      const ctxid = shortcuts.getCurrentContextId();
+
+      if (ctxid) {
+        try {
+          const resp = await shortcuts.callJsonApi("/chat_files_path_get", {
+            ctxid,
+          });
+          if (resp.ok) path = resp.path;
+        } catch (_e) {
+          console.error("Error getting chat files path", _e);
+        }
       }
     }
-    await fileBrowserStore.open(path);
+    let opened = false;
+    try {
+      opened = await openLatestSurface("files", { path, source: "sidebar" });
+    } catch (error) {
+      console.error("Error opening Files surface", error);
+    }
+    if (!opened) await fileBrowserStore.open(path);
+  },
+
+  focus() {
+    const chatInput = this._activeTextarea();
+    if (chatInput) {
+      chatInput.focus();
+    }
+  },
+
+  _loadHistory() {
+    let ctxid = null;
+    try { ctxid = shortcuts.getCurrentContextId(); } catch (_e) { ctxid = null; }
+    this._historyCtxid = ctxid;
+    this._history = [];
+    this._historyIndex = null;
+    this._draft = "";
+    if (!ctxid) return;
+    let raw = null;
+    try { raw = localStorage.getItem("a0:chat-history:" + ctxid); } catch (_e) { raw = null; }
+    if (raw !== null) {
+      try {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr)) {
+          this._history = arr.filter((s) => typeof s === "string");
+        }
+      } catch (_e) { /* ignore */ }
+      return;
+    }
+    // No entry yet for this chat: seed from rendered chat DOM (one-time bootstrap)
+    try {
+      const seeded = this._seedFromChatDom();
+      if (seeded.length > 0) {
+        this._history = seeded;
+        this._saveHistory();
+      } else {
+        // Persist an empty array so we don't re-seed on every nav; respects user clearing
+        this._saveHistory();
+      }
+    } catch (_e) { /* ignore */ }
+  },
+
+  _seedFromChatDom() {
+    const out = [];
+    let nodes;
+    try {
+      nodes = document.querySelectorAll(".user-container .message-user .message-text pre");
+    } catch (_e) {
+      return out;
+    }
+    for (const pre of nodes) {
+      const text = (pre.textContent || "").trim();
+      if (!text) continue;
+      if (out.length > 0 && out[out.length - 1] === text) continue; // ignoredups
+      out.push(text);
+    }
+    if (out.length > 50) return out.slice(-50);
+    return out;
+  },
+
+  _saveHistory() {
+    if (!this._historyCtxid) return;
+    try {
+      localStorage.setItem(
+        "a0:chat-history:" + this._historyCtxid,
+        JSON.stringify(this._history)
+      );
+    } catch (_e) { /* ignore quota / disabled */ }
+  },
+
+  _ensureHistoryLoaded() {
+    let ctxid = null;
+    try { ctxid = shortcuts.getCurrentContextId(); } catch (_e) { ctxid = null; }
+    if (ctxid !== this._historyCtxid) {
+      this._loadHistory();
+    }
+  },
+
+  _pushHistory(text) {
+    if (typeof text !== "string") return;
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    this._ensureHistoryLoaded();
+    if (this._history.length > 0 && this._history[this._history.length - 1] === trimmed) {
+      this._historyIndex = null;
+      this._draft = "";
+      return;
+    }
+    this._history.push(trimmed);
+    if (this._history.length > 50) {
+      this._history = this._history.slice(-50);
+    }
+    this._saveHistory();
+    this._historyIndex = null;
+    this._draft = "";
+  },
+
+  _setCaretStart() {
+    queueMicrotask(() => {
+      const ta = this._activeTextarea();
+      if (ta) {
+        try { ta.setSelectionRange(0, 0); } catch (_e) { /* ignore */ }
+        try { ta.scrollTop = 0; } catch (_e) { /* ignore */ }
+        this._syncCaretFromEvent({ target: ta });
+      }
+      this.adjustTextareaHeight();
+    });
+  },
+
+  _setCaretEnd() {
+    queueMicrotask(() => {
+      const ta = this._activeTextarea();
+      if (ta) {
+        const end = ta.value.length;
+        try { ta.setSelectionRange(end, end); } catch (_e) { /* ignore */ }
+        try { ta.scrollTop = ta.scrollHeight; } catch (_e) { /* ignore */ }
+        this._syncCaretFromEvent({ target: ta });
+      }
+      this.adjustTextareaHeight();
+    });
+  },
+
+  historyPrev($event) {
+    if ($event && ($event.isComposing || $event.keyCode === 229)) return;
+    const ta = ($event && $event.target) ? $event.target : this._activeTextarea();
+    if (!ta) return;
+    const start = ta.selectionStart;
+    const end = ta.selectionEnd;
+    if (start !== 0 || end !== 0) return;
+    $event.preventDefault();
+    this._ensureHistoryLoaded();
+    if (this._history.length === 0) return;
+    if (this._historyIndex === null) {
+      this._draft = this.message || "";
+      this._historyIndex = this._history.length - 1;
+    } else if (this._historyIndex > 0) {
+      this._historyIndex -= 1;
+    } else {
+      return;
+    }
+    this.message = this._history[this._historyIndex];
+    this._setCaretStart();
+  },
+
+  historyNext($event) {
+    if ($event && ($event.isComposing || $event.keyCode === 229)) return;
+    const ta = ($event && $event.target) ? $event.target : this._activeTextarea();
+    if (!ta) return;
+    const value = ta.value;
+    const start = ta.selectionStart;
+    const end = ta.selectionEnd;
+    if (start !== value.length || end !== value.length) return;
+    $event.preventDefault();
+    if (this._historyIndex === null) return;
+    if (this._historyIndex < this._history.length - 1) {
+      this._historyIndex += 1;
+      this.message = this._history[this._historyIndex];
+    } else {
+      this._historyIndex = null;
+      this.message = this._draft || "";
+      this._draft = "";
+    }
+    this._setCaretEnd();
   },
 
   reset() {
     this.message = "";
     attachmentsStore.clearAttachments();
+    this.chatMoreMenuOpen = false;
+    this._caretIndex = 0;
+    this._historyIndex = null;
+    this._draft = "";
     this.adjustTextareaHeight();
   }
 };

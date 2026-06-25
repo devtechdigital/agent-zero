@@ -1,11 +1,12 @@
 import { io } from "/vendor/socket.io.esm.min.js";
 import { getCsrfToken, getRuntimeId, invalidateCsrfToken } from "/js/api.js";
+import { getCurrentUserISOString } from "/js/time-utils.js";
 
 const MAX_PAYLOAD_BYTES = 50 * 1024 * 1024; // 50MB hard cap per contract
 const DEFAULT_TIMEOUT_MS = 0;
 
 const _UUID_HEX = [..."0123456789abcdef"];
-const _OPTION_KEYS = new Set(["correlationId"]);
+const _OPTION_KEYS = new Set(["correlationId", "includeHandlers", "excludeHandlers", "excludeSids"]);
 
 /**
  * @param {unknown} value
@@ -113,6 +114,15 @@ function normalizeNamespace(value) {
     return "/";
   }
   return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+}
+
+function hasWildcardPattern(value) {
+  return typeof value === "string" && value.includes("*");
+}
+
+function compileEventPattern(value) {
+  const escaped = value.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
+  return new RegExp(`^${escaped.replaceAll("*", ".*")}$`);
 }
 
 /**
@@ -265,6 +275,33 @@ class WebSocketClient {
     this._csrfInvalidatedForConnectError = false;
     this._connectErrorRetryTimer = null;
     this._connectErrorRetryAttempt = 0;
+    this._handlers = new Set();
+  }
+
+  /**
+   * Declare WS handler paths to activate on connect (e.g. "ws_webui").
+   * Must be called before connect().
+   * @param {string[]} handlers
+   */
+  addHandlers(handlers) {
+    if (!Array.isArray(handlers)) return;
+    let changed = false;
+    for (const h of handlers) {
+      if (typeof h === "string" && h.trim()) {
+        const key = h.trim();
+        if (!this._handlers.has(key)) {
+          this._handlers.add(key);
+          changed = true;
+        }
+      }
+    }
+    // If new handlers were added while already connected, reconnect so the
+    // updated handler list is sent to the server via the auth callback.
+    if (changed && this.socket && this.socket.connected) {
+      this.debugLog("addHandlers: reconnecting to activate new handlers", [...this._handlers]);
+      this.socket.disconnect();
+      this.socket.connect();
+    }
   }
 
   _clearConnectErrorRetryTimer() {
@@ -297,7 +334,7 @@ class WebSocketClient {
   }
 
   buildPayload(data) {
-    const ts = new Date().toISOString();
+    const ts = getCurrentUserISOString();
     if (data == null) {
       return { ts, data: {} };
     }
@@ -487,9 +524,18 @@ class WebSocketClient {
     await this.connect();
 
     if (!this.subscriptions.has(eventType)) {
-      const handler = (payload) => {
+      const isWildcard = hasWildcardPattern(eventType);
+      const eventPattern = isWildcard ? compileEventPattern(eventType) : null;
+      const handler = (...args) => {
         const entry = this.subscriptions.get(eventType);
         if (!entry) return;
+        const currentIsWildcard = Boolean(entry.eventPattern);
+        const payload = isWildcard ? args[1] : args[0];
+        const incomingEventType = isWildcard ? args[0] : eventType;
+        if (currentIsWildcard) {
+          if (typeof incomingEventType !== "string") return;
+          if (!entry.eventPattern.test(incomingEventType)) return;
+        }
         let envelope;
         try {
           envelope = validateServerEnvelope(payload);
@@ -501,6 +547,10 @@ class WebSocketClient {
 
         entry.callbacks.forEach((cb) => {
           try {
+            if (currentIsWildcard) {
+              cb(incomingEventType, envelope);
+              return;
+            }
             cb(envelope);
           } catch (error) {
             console.error("WebSocket callback error:", error);
@@ -509,11 +559,16 @@ class WebSocketClient {
       };
 
       this.subscriptions.set(eventType, {
+        eventPattern,
         handler,
         callbacks: new Set(),
       });
 
-      this.socket.on(eventType, handler);
+      if (isWildcard) {
+        this.socket.onAny(handler);
+      } else {
+        this.socket.on(eventType, handler);
+      }
     }
 
     const entry = this.subscriptions.get(eventType);
@@ -532,7 +587,11 @@ class WebSocketClient {
 
     if (entry.callbacks.size === 0) {
       if (this.socket) {
-        this.socket.off(eventType, entry.handler);
+        if (entry.eventPattern) {
+          this.socket.offAny(entry.handler);
+        } else {
+          this.socket.off(eventType, entry.handler);
+        }
       }
       this.subscriptions.delete(eventType);
     }
@@ -563,11 +622,12 @@ class WebSocketClient {
       transports: ["websocket", "polling"],
       withCredentials: true,
       auth: (cb) => {
+        const handlers = [...this._handlers];
         getCsrfToken()
-          .then((token) => cb({ csrf_token: token }))
+          .then((token) => cb({ csrf_token: token, handlers }))
           .catch((error) => {
             console.error("[websocket] failed to fetch CSRF token for connect", error);
-            cb({});
+            cb({ handlers });
           });
       },
     });
@@ -685,5 +745,3 @@ export function getNamespacedClient(namespace) {
   _namespacedClients.set(key, client);
   return client;
 }
-
-export const websocket = getNamespacedClient("/");

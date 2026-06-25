@@ -1,10 +1,10 @@
 import { createStore } from "/js/AlpineStore.js";
-import { getContext } from "/index.js";
 import { store as chatsStore } from "/components/sidebar/chats/chats-store.js";
-import { store as memoryStore } from "/components/modals/memory/memory-dashboard-store.js";
+import { store as memoryStore } from "/plugins/_memory/webui/memory-dashboard-store.js";
 import { store as projectsStore } from "/components/projects/projects-store.js";
-import { store as chatInputStore } from "/components/chat/input/input-store.js";
+import { store as fileBrowserStore } from "/components/modals/file-browser/file-browser-store.js";
 import * as API from "/js/api.js";
+import { getCurrentUserISOString } from "/js/time-utils.js";
 
 const model = {
   // State
@@ -12,15 +12,21 @@ const model = {
   bannersLoading: false,
   lastBannerRefresh: 0,
   hasDismissedBanners: false,
+  _initialized: false,
 
   get isVisible() {
     return !chatsStore.selected;
   },
 
   init() {
-    // Reload banners when settings change
-    document.addEventListener("settings-updated", () => {
-      this.refreshBanners(true);
+    if (this._initialized) return;
+    this._initialized = true;
+
+    // Reload banners when a modal closes while the welcome screen is visible.
+    document.addEventListener("modal-closed", () => {
+      if (this.isVisible) {
+        this.refreshBanners(true);
+      }
     });
   },
 
@@ -38,7 +44,7 @@ const model = {
       hostname: window.location.hostname,
       port: window.location.port,
       browser: navigator.userAgent,
-      timestamp: new Date().toISOString(),
+      timestamp: getCurrentUserISOString(),
     };
   },
 
@@ -135,9 +141,80 @@ const model = {
   },
 
   get sortedBanners() {
-    return [...this.banners].sort(
-      (a, b) => (b.priority || 0) - (a.priority || 0),
-    );
+    return [...this.banners]
+      .filter((b) => b.id !== "system-resources")
+      .filter((b) => b.id !== "missing-api-key")
+      .filter((b) => b.type !== "hero" && b.type !== "feature")
+      .sort((a, b) => (b.priority || 0) - (a.priority || 0));
+  },
+
+  get systemResourceBanner() {
+    return this.banners.find((b) => b.id === "system-resources") || null;
+  },
+
+  get blockingSetupBanner() {
+    return this.banners.find((b) => b.id === "missing-api-key") || null;
+  },
+
+  get hasBlockingSetupBanner() {
+    return Boolean(this.blockingSetupBanner);
+  },
+
+  get heroSubtitle() {
+    if (this.hasBlockingSetupBanner) {
+      return "One setup step before chatting.";
+    }
+    return "How can I help you today?";
+  },
+
+  openBlockingSetup() {
+    const path =
+      this.blockingSetupBanner?.auto_modal_path ||
+      "/plugins/_onboarding/webui/onboarding.html";
+    window.openModal(path);
+  },
+
+  executeBannerAction(action) {
+    if (!action) return;
+
+    if (action.startsWith("open-modal:")) {
+      const path = action.slice("open-modal:".length);
+      this.openModalPath(path);
+      return;
+    }
+
+    if (action.startsWith("open-url:")) {
+      const url = action.slice("open-url:".length);
+      if (url) window.open(url, "_blank", "noopener,noreferrer");
+    }
+  },
+
+  handleBannerHtmlClick(event) {
+    const actionTarget = event?.target?.closest?.("[data-banner-action]");
+    if (!actionTarget) return;
+    const action = actionTarget.getAttribute("data-banner-action");
+    if (!action) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    this.executeBannerAction(action);
+  },
+
+  openModalPath(path) {
+    if (!path) return;
+
+    let modalPath = path;
+    let hash = "";
+    const hashIndex = path.indexOf("#");
+    if (hashIndex !== -1) {
+      modalPath = path.slice(0, hashIndex);
+      hash = path.slice(hashIndex + 1);
+    }
+
+    if (hash) {
+      history.replaceState(null, "", `#${hash}`);
+    }
+    if (modalPath) window.openModal(modalPath);
   },
 
   /**
@@ -200,11 +277,10 @@ const model = {
         window.openModal("modals/scheduler/scheduler-modal.html");
         break;
       case "settings":
-        // Open settings modal
-        const settingsButton = document.getElementById("settings");
-        if (settingsButton) {
-          settingsButton.click();
-        }
+        window.openModal("settings/settings.html");
+        break;
+      case "plugins":
+        window.openModal("components/plugins/list/plugin-list.html");
         break;
       case "projects":
         projectsStore.openProjectsModal();
@@ -213,13 +289,10 @@ const model = {
         memoryStore.openModal();
         break;
       case "files":
-        chatInputStore.browseFiles();
+        fileBrowserStore.open();
         break;
       case "website":
         window.open("https://agent-zero.ai", "_blank");
-        break;
-      case "github":
-        window.open("https://github.com/agent0ai/agent-zero", "_blank");
         break;
     }
   },
